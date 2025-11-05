@@ -6,13 +6,12 @@ pub mod arch;
 
 use axerrno::{AxError, AxResult};
 use axtask::current;
-use axlog::warn;
+use axlog::debug;
 use arch::current::UserRegs;
 use crate::arch::RegAccess;
 use starry_vm::{vm_read_slice, vm_write_slice};
 use starry_core::task::AsThread;
 use axhal::uspace::UserContext;
-use axlog::error;
 
 
 const REQ_TRACEME: u32 = 0;
@@ -28,6 +27,9 @@ const REQ_GETREGSET: u32 = 0x4204;
 // Minimal note type for general-purpose regs
 const NT_PRSTATUS: usize = 1;
 use state::{ensure_state_for_current, ensure_state_for_pid, set_syscall_tracing, resume_pid, PtraceOptions};
+
+// Export for use in execve syscall
+pub use state::{stop_current_and_wait, StopReason};
 
 /// Minimal ptrace dispatcher for Phase 1.
 ///
@@ -51,9 +53,9 @@ pub fn do_ptrace(request: u32, pid: i32, addr: usize, data: usize) -> AxResult<i
             });
             // Debug: record that TRACEME was requested and which tracer we recorded.
             if let Some(ppid) = parent {
-                warn!("ptrace: TRACEME pid={} tracer={}", current().as_thread().proc_data.proc.pid(), ppid);
+                debug!("ptrace: TRACEME pid={} tracer={}", current().as_thread().proc_data.proc.pid(), ppid);
             } else {
-                warn!("ptrace: TRACEME pid={} tracer=None", current().as_thread().proc_data.proc.pid());
+                debug!("ptrace: TRACEME pid={} tracer=None", current().as_thread().proc_data.proc.pid());
             }
             Ok(0)
         }
@@ -113,15 +115,15 @@ pub fn do_ptrace(request: u32, pid: i32, addr: usize, data: usize) -> AxResult<i
                 set_syscall_tracing(&st, true);
                 pid as i32
             };
-            // PTRACE_SYSCALL 语义包含“继续执行直到下一个系统调用入口/出口”。
-            warn!("ptrace: PTRACE_SYSCALL requested by pid={} target={}", current().as_thread().proc_data.proc.pid(), target_pid);
+            // PTRACE_SYSCALL 语义包含"继续执行直到下一个系统调用入口/出口"。
+            debug!("ptrace: PTRACE_SYSCALL requested by pid={} target={}", current().as_thread().proc_data.proc.pid(), target_pid);
             resume_pid(target_pid as _);
             Ok(0)
         }
         REQ_GETREGSET => {
             // Only support NT_PRSTATUS for now.
             if addr != NT_PRSTATUS {
-                error!("ptrace: GETREGSET unsupported note type addr={}", addr);
+                debug!("ptrace: GETREGSET unsupported note type addr={}", addr);
                 return Err(AxError::Unsupported);
             }
 
@@ -129,18 +131,18 @@ pub fn do_ptrace(request: u32, pid: i32, addr: usize, data: usize) -> AxResult<i
             let st = ensure_state_for_pid(pid)?;
             let regs = st.with(|s| {
                 if !s.stopped {
-                    error!("ptrace: GETREGSET pid={} not stopped", pid);
+                    debug!("ptrace: GETREGSET pid={} not stopped", pid);
                     return Err(AxError::InvalidInput);
                 }
                 if let Some(saved) = s.saved {
                     Ok(UserRegs::from_ctx(&saved.tf, saved.sp))
                 } else {
-                    error!("ptrace: GETREGSET pid={} no saved context", pid);
+                    debug!("ptrace: GETREGSET pid={} no saved context", pid);
                     Err(AxError::InvalidInput)
                 }
             })?;
 
-            error!("ptrace: GETREGSET pid={} returning registers: x8(syscall)=0x{:x} x0-x2=0x{:x},0x{:x},0x{:x} pc=0x{:x}", 
+            debug!("ptrace: GETREGSET pid={} returning registers: x8(syscall)=0x{:x} x0-x2=0x{:x},0x{:x},0x{:x} pc=0x{:x}",
                   pid, regs.x[8], regs.x[0], regs.x[1], regs.x[2], regs.pc);
 
             // The user passes a pointer to a single iovec in its address space.
