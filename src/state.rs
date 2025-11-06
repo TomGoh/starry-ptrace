@@ -9,7 +9,7 @@ use axerrno::{AxError, AxResult};
 use starry_core::task::get_process_data;
 use starry_process::Pid;
 use bitflags::bitflags;
-use axlog::{info, warn};
+use axlog::{info, debug};
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -34,6 +34,7 @@ pub enum StopReason {
     SyscallEntry,
     SyscallExit,
     Signal(i32),
+    Exec,
 }
 
 pub struct PtraceState {
@@ -138,10 +139,10 @@ pub fn stop_current_and_wait(reason: StopReason, uctx: &axhal::uspace::UserConte
             .and_then(|b| b.as_mut().downcast_mut::<PtraceState>())
             .expect("ptrace_state is not PtraceState");
         // Mark stopped and record reason when tracing is enabled.
-        // Syscall stops require `syscall_trace`; signal-delivery stops always stop.
+        // Syscall stops require `syscall_trace`; signal-delivery and exec stops always stop.
         let should_stop = match reason {
             StopReason::SyscallEntry | StopReason::SyscallExit => st.being_traced && st.syscall_trace,
-            StopReason::Signal(_) => st.being_traced,
+            StopReason::Signal(_) | StopReason::Exec => st.being_traced,
         };
         if should_stop {
             st.stopped = true;
@@ -198,10 +199,12 @@ pub fn encode_ptrace_stop_status(pid: Pid) -> Option<i32> {
     if st.stopped {
         // Encode stop signal:
         // - Syscall stops report SIGTRAP (optionally OR 0x80 with TRACESYSGOOD)
+        // - Exec stops report SIGTRAP
         // - Signal-delivery stops report the actual signal number
         const SIGTRAP: i32 = 5;
         let mut sig = match st.stop_reason {
             Some(StopReason::SyscallEntry) | Some(StopReason::SyscallExit) => SIGTRAP,
+            Some(StopReason::Exec) => SIGTRAP,
             Some(StopReason::Signal(n)) => n,
             None => SIGTRAP,
         };
@@ -225,7 +228,7 @@ pub fn encode_ptrace_stop_status_for_tracer(pid: Pid, expected_tracer: Pid) -> O
     let mut guard = pd.ptrace_state.lock();
     let st = guard.as_mut()?.as_mut().downcast_mut::<PtraceState>()?;
     // Debug: print the current ptrace state to help diagnose tracer/tracee mismatches
-    warn!("ptrace: encode_for_tracer pid={} stopped={} stop_reported={} st.tracer={:?} expected={}",
+    debug!("ptrace: encode_for_tracer pid={} stopped={} stop_reported={} st.tracer={:?} expected={}",
         pid, st.stopped, st.stop_reported, st.tracer, expected_tracer);
 
     if st.stopped && !st.stop_reported && st.tracer == Some(expected_tracer) {
@@ -235,6 +238,7 @@ pub fn encode_ptrace_stop_status_for_tracer(pid: Pid, expected_tracer: Pid) -> O
         const SIGTRAP: i32 = 5;
         let mut sig = match st.stop_reason {
             Some(StopReason::SyscallEntry) | Some(StopReason::SyscallExit) => SIGTRAP,
+            Some(StopReason::Exec) => SIGTRAP,
             Some(StopReason::Signal(n)) => n,
             None => SIGTRAP,
         };
@@ -244,7 +248,7 @@ pub fn encode_ptrace_stop_status_for_tracer(pid: Pid, expected_tracer: Pid) -> O
             sig |= 0x80;
         }
         let status = (sig << 8) | 0x7f;
-        warn!("ptrace: encode stop status pid={} reason={:?} sig={} status=0x{:x}", 
+        debug!("ptrace: encode stop status pid={} reason={:?} sig={} status=0x{:x}",
               pid, st.stop_reason, sig, status);
         Some(status)
     } else {

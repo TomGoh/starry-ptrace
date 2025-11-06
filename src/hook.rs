@@ -1,6 +1,6 @@
 extern crate alloc;
 use axhal::uspace::UserContext;
-use axlog::error;
+use axlog::debug;
 use core::sync::atomic::{AtomicBool, Ordering};
 use starry_core::hooks::{register_syscall_hook, SyscallHook};
 
@@ -13,7 +13,7 @@ impl SyscallHook for SysHook {
         let Ok(st) = ensure_state_for_current() else { return; };
         let should_stop = st.with(|s| s.being_traced && s.syscall_trace);
         if should_stop {
-            error!("ptrace: syscall_entry hook triggered, sysno={} (x8=0x{:x})", uctx.sysno(), uctx.sysno());
+            debug!("ptrace: syscall_entry hook triggered, sysno={} (x8=0x{:x})", uctx.sysno(), uctx.sysno());
             stop_current_and_wait(StopReason::SyscallEntry, uctx);
         }
     }
@@ -22,7 +22,7 @@ impl SyscallHook for SysHook {
         let Ok(st) = ensure_state_for_current() else { return; };
         let should_stop = st.with(|s| s.being_traced && s.syscall_trace);
         if should_stop {
-            error!("ptrace: syscall_exit hook triggered, retval=0x{:x}", uctx.retval());
+            debug!("ptrace: syscall_exit hook triggered, retval=0x{:x}", uctx.retval());
             stop_current_and_wait(StopReason::SyscallExit, uctx);
         }
     }
