@@ -35,16 +35,33 @@ use state::{ensure_state_for_current, ensure_state_for_pid, set_syscall_tracing,
 // Export for use in execve syscall
 pub use state::{stop_current_and_wait, StopReason};
 
-/// Minimal ptrace dispatcher for Phase 1.
-///
-/// - PTRACE_TRACEME: 标记当前进程被父进程跟踪（仅设置状态，不做唤醒/等待）。
-/// - PTRACE_SYSCALL: 开启“下一次系统调用入口/出口停靠”的跟踪模式（仅设置状态）。
-/// 其余请求暂返回 EINVAL，后续阶段逐步补齐。
+/// Main ptrace interface function, which would be called by the ptrace syscall handler.
+/// 
+/// Currently supported requests are:
+/// - REQ_TRACEME: Mark the current process as being traced by its parent.
+/// - REQ_GETREGS: Retrieve the general-purpose registers of a stopped tracee.
+/// - REQ_CONT: Resume a stopped tracee, optionally injecting a signal.
+/// - REQ_DETACH: Detach from a tracee and resume it.
+/// - REQ_SYSCALL: Resume a tracee and stop at next syscall entry/exit.
+/// - REQ_GETREGSET: Retrieve register sets (only NT_PRSTATUS supported).
+/// - REQ_SETOPTIONS: Set ptrace options for a tracee.
+/// - REQ_PEEKDATA: Read data from a tracee's memory.
+/// 
+/// # Arguments
+/// * `request` - The ptrace request code.
+/// * `pid` - The target process ID for the request.
+/// * `addr` - An address or parameter, meaning depends on request.
+/// * `data` - Additional data or parameter, meaning depends on request.
+/// 
+/// # Returns
+/// * `AxResult<isize>` - Result of the ptrace operation, or error.
 pub fn do_ptrace(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<isize> {
     hook::register_hooks_once();
 
     match request {
         REQ_TRACEME => {
+            // Handle TRACEME request for the current process
+            // First, get ptrace state, pid, and parent for current process
             let st = ensure_state_for_current()?;
             let curr_pid = current().as_thread().proc_data.proc.pid();
             let parent = {
@@ -53,6 +70,7 @@ pub fn do_ptrace(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<i
                 proc.parent().map(|p| p.pid())
             };
 
+            // If no parent, cannot trace, since the only process without a parent is init
             if parent.is_none() {
                 debug!("ptrace: TRACEME called but no parent for pid={}", curr_pid);
                 return Err(AxError::InvalidInput);
@@ -65,6 +83,7 @@ pub fn do_ptrace(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<i
                 return Err(AxError::InvalidInput);
             }
 
+            // Mark as being traced by parent
             st.with_mut(|s| {
                 s.being_traced = true;
                 s.tracer = parent;
@@ -74,6 +93,9 @@ pub fn do_ptrace(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<i
             Ok(0)
         }
         REQ_GETREGS => {
+            // Handle GETREGS request to retrieve general-purpose registers of a stopped tracee
+            // This option won't work under AArch64; use GETREGSET instead.
+            debug!("[PTRACE-DEBUG] PTRACE_GETREGS request for pid={}", pid);
             let st = ensure_state_for_pid(pid)?;
             let regs = st.with(|s| {
                 if !s.stopped {
@@ -92,17 +114,20 @@ pub fn do_ptrace(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<i
                     core::mem::size_of::<UserRegs>(),
                 )
             };
+            // Write to user space
             vm_write_slice(data as *mut u8, buf)?;
             Ok(0)
         }
         REQ_CONT => {
+            // Handle CONT request to resume a stopped tracee
             // Resume the specified pid, optionally injecting a signal
             // The 'data' parameter contains the signal number to inject/deliver (0 = suppress)
             debug!("[PTRACE-DEBUG] PTRACE_CONT request for pid={} with signal={}", pid, data);
 
+            // Get ptrace state for the target pid
             let st = ensure_state_for_pid(pid)?;
 
-            // Check if we're resuming from a signal-delivery-stop
+            // Check if we're resuming from a signal-delivery-stop, extract the delayed-delivery signal
             let stop_signal = st.with(|s| {
                 if let Some(state::StopReason::Signal(sig)) = s.stop_reason {
                     Some(sig)
@@ -111,6 +136,7 @@ pub fn do_ptrace(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<i
                 }
             });
 
+            // Clear stopped state and stop reason
             st.with_mut(|s| {
                 debug!("[PTRACE-DEBUG] PTRACE_CONT clearing stopped state for pid={}, was stopped={} reason={:?}",
                        pid, s.stopped, s.stop_reason);
@@ -122,18 +148,18 @@ pub fn do_ptrace(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<i
 
             // Handle signal injection/delivery based on stop reason
             if let Some(stopped_at_signal) = stop_signal {
-                // We're resuming from a signal-delivery-stop
+                // We're resuming from a signal-delivery-stop, there is a pending signal
                 debug!("[PTRACE-DEBUG] PTRACE_CONT resuming from signal-delivery-stop (sig={}), data={}",
                        stopped_at_signal, data);
 
                 if data == 0 {
                     // data=0 means suppress the signal - the signal is already pending,
                     // and by not re-injecting it and just resuming, the check_signals
-                    // has already returned, so the signal won't be processed
+                    // has already returned, so the signal won't be processed, simply continue
                     debug!("[PTRACE-DEBUG] PTRACE_CONT suppressing signal {}", stopped_at_signal);
                 } else if data as i32 == stopped_at_signal {
                     // data matches the stop signal - let it proceed (don't inject new one)
-                    // The signal is already pending and will be processed after resume
+                    // The signal is already pending and will be processed after resume, so just continue
                     debug!("[PTRACE-DEBUG] PTRACE_CONT letting pending signal {} proceed", stopped_at_signal);
                 } else {
                     // data is different - inject the new signal to replace the old one
@@ -150,7 +176,7 @@ pub fn do_ptrace(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<i
                     }
                 }
             } else if data != 0 {
-                // Not at a signal-delivery-stop, inject new signal
+                // Not at a signal-delivery-stop, the request is to inject a new signal
                 if let Some(signo) = Signo::from_repr(data as u8) {
                     debug!("[PTRACE-DEBUG] PTRACE_CONT injecting signal {:?} into pid={}", signo, pid);
                     let sig_info = SignalInfo::new_kernel(signo);
@@ -165,31 +191,40 @@ pub fn do_ptrace(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<i
                 }
             }
 
+            // After handling signal injection/delivery, resume the tracee
             resume_pid(pid as _);
             debug!("[PTRACE-DEBUG] PTRACE_CONT completed for pid={}", pid);
             Ok(0)
         }
         REQ_DETACH => {
+            // Handle the DETACH request to stop tracing a tracee and resume it
+            debug!("[PTRACE-DEBUG] PTRACE_DETACH request for pid={}", pid);
             // Clear tracing state and resume the task.
             let st = ensure_state_for_pid(pid)?;
+            // Clear being_traced and syscall_trace flags
             st.with_mut(|s| {
                 s.being_traced = false;
                 s.syscall_trace = false;
                 s.tracer = None;
             });
+            // Resume the detached process
             resume_pid(pid as _);
             Ok(0)
         }
         REQ_SYSCALL => {
-            // Linux: 通常由 tracer 对 tracee 调用；Phase 1 允许 pid=0 代表当前。
+            // Handle the SYSCALL request to enable syscall tracing and resume the tracee
+            // In Linux, this is typically called by the tracer on the tracee,
+            // we now allow pid=0 to mean the current process.
             // The 'data' parameter contains optional signal to inject (0 = no signal)
             debug!("[PTRACE-DEBUG] PTRACE_SYSCALL request for pid={} with signal={}", pid, data);
             let target_pid = if pid == 0 {
+                // If pid=0, operate on current process
                 let st = ensure_state_for_current()?;
                 set_syscall_tracing(&st, true);
                 debug!("[PTRACE-DEBUG] PTRACE_SYSCALL enabled syscall tracing for current process");
                 0
             } else {
+                // Operate on specified pid
                 let st = ensure_state_for_pid(pid)?;
                 set_syscall_tracing(&st, true);
                 debug!("[PTRACE-DEBUG] PTRACE_SYSCALL enabled syscall tracing for pid={}", pid);
@@ -212,13 +247,18 @@ pub fn do_ptrace(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<i
                 }
             }
 
-            // PTRACE_SYSCALL 语义包含"继续执行直到下一个系统调用入口/出口"。
+            // After enabling syscall tracing (and optional signal injection), resume the tracee
+            // This is required by ptrace semantics to continue execution, which would pause 
+            // the tracee at the next syscall entry/exit or signal delivery.
             debug!("[PTRACE-DEBUG] PTRACE_SYSCALL resuming target pid={}", target_pid);
             resume_pid(target_pid);
             debug!("[PTRACE-DEBUG] PTRACE_SYSCALL completed for target pid={}", target_pid);
             Ok(0)
         }
         REQ_GETREGSET => {
+            // Handle GETREGSET request to retrieve register sets of a stopped tracee
+            // This is used by strace on AArch64 instead of GETREGS
+            debug!("[PTRACE-DEBUG] PTRACE_GETREGSET request for pid={} addr={} data=0x{:x}", pid, addr, data);
             // Only support NT_PRSTATUS for now.
             if addr != NT_PRSTATUS {
                 debug!("ptrace: GETREGSET unsupported note type addr={}", addr);
@@ -282,7 +322,11 @@ pub fn do_ptrace(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<i
             Ok(0)
         }
         REQ_SETOPTIONS => {
+            // Handle SETOPTIONS request to set ptrace options for a tracee
+            debug!("[PTRACE-DEBUG] PTRACE_SETOPTIONS request for pid={} options=0x{:x}", pid, data);
+            // Set the options in the ptrace state
             let st = ensure_state_for_pid(pid)?;
+            // Parse options from data, if valid, set them into the state
             if let Some(opts) = PtraceOptions::from_bits(data as u32) {
                 st.with_mut(|s| s.options = opts);
                 Ok(0)
@@ -291,6 +335,9 @@ pub fn do_ptrace(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<i
             }
         }
         REQ_PEEKDATA => {
+            // Handle PEEKDATA request to read data from a tracee's memory
+            debug!("[PTRACE-DEBUG] PTRACE_PEEKDATA request for pid={} addr=0x{:x}", pid, addr);
+            // Target must be stopped
             let st = ensure_state_for_pid(pid)?;
             let is_stopped = st.with(|s| s.stopped);
 
@@ -299,6 +346,8 @@ pub fn do_ptrace(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<i
                 return Err(AxError::InvalidInput);
             }
 
+            // Read a word (8 bytes) from the tracee's memory at the specified address
+            // The reason why we read 8 bytes is that on AArch64, ptrace PEEKDATA reads a word-sized value.
             let mut buf = [0u8; 8];
             mm::read_from_tracee(pid, addr, &mut buf)?;
             vm_write_slice(data as *mut u8, &buf)?;
@@ -311,6 +360,13 @@ pub fn do_ptrace(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<i
 }
 
 /// Check if a given pid is in ptrace-stop; return encoded wait status if so.
+/// 
+/// # Arguments
+/// * `pid` - The process ID to check.
+/// 
+/// # Returns
+/// * `Some(i32)` - Encoded wait status if the tracee is stopped.
+/// * `None` - If the tracee is not stopped.
 pub fn check_ptrace_stop(pid: Pid) -> Option<i32> {
     if pid == 0 { return None; }
     // Only report stops for children that are actually traced by the caller.
@@ -320,6 +376,9 @@ pub fn check_ptrace_stop(pid: Pid) -> Option<i32> {
 }
 
 /// Check if the current process is being traced.
+/// 
+/// # Returns
+/// * `bool` - True if the **current** process is being traced, false otherwise.
 pub fn is_being_traced() -> bool {
     if let Ok(st) = state::ensure_state_for_current() {
         st.with(|s| s.being_traced)
@@ -333,6 +392,13 @@ pub fn is_being_traced() -> bool {
 /// This is used by the signal handling path to emulate Linux ptrace behavior
 /// where a tracee stops for signal delivery and waits for the tracer to decide
 /// whether to deliver or suppress the signal.
+/// 
+/// Instead of sending a stop signal,
+/// we directly enter a ptrace stop state and block the tracee until resumed by the tracer.
+/// 
+/// # Arguments
+/// * `signo` - The signal number causing the stop.
+/// * `uctx` - The user context of the current task.
 #[inline]
 pub fn signal_stop(signo: i32, uctx: &UserContext) {
     // Best-effort: only stop if being traced; the helper handles checks.

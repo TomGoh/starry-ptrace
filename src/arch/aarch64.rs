@@ -13,6 +13,15 @@ pub struct UserRegs {
 }
 
 impl RegAccess for UserRegs {
+    /// Build the user-visible register set from a trap context.
+    /// Some architectures keep SP outside the TrapFrame (e.g., AArch64 stores
+    /// user SP in UserContext). So we pass it separately.
+    /// 
+    /// # Arguments
+    /// * `tf` - The trap frame of the current task.
+    /// * `sp` - The user stack pointer.
+    /// # Returns
+    /// * `Self` - The constructed UserRegs instance.
     fn from_ctx(tf: &axhal::context::TrapFrame, sp: u64) -> Self {
         let mut regs = UserRegs::default();
         regs.x.copy_from_slice(&tf.x[0..31]);

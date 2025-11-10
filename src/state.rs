@@ -126,6 +126,21 @@ pub fn set_syscall_tracing(st: &ProcState, on: bool) {
 }
 
 /// Stop the current process for ptrace and block until resumed.
+/// 
+/// This function would:
+/// 1. Acquire the ptrace_state lock for the current process.
+/// 2. Check if the process is being traced and should stop for the given reason.
+/// 3. If so, set up the stop state, create an event listener, and wake the tracer.
+/// 4. Release the lock and block the current task until resumed by the tracer.
+/// 
+/// In short, this function implements the core logic for ptrace stops, it would
+/// not return until the tracer resumes the tracee. The stopping status of the tracee
+/// is done by blocking on an event listener that is notified until the tracer resumes it
+/// by notifying the event.
+/// 
+/// # Arguments
+/// * `reason` - The reason for stopping (e.g., syscall entry/exit, signal delivery).
+/// * `uctx` - The user context of the current process, used to save state.
 pub fn stop_current_and_wait(reason: StopReason, uctx: &axhal::uspace::UserContext) {
 
     let pd = get_process_data(0).expect("current process");
@@ -153,10 +168,11 @@ pub fn stop_current_and_wait(reason: StopReason, uctx: &axhal::uspace::UserConte
         return;
     }
 
-    // CRITICAL FIX: Create listener BEFORE releasing lock to prevent race condition
+    // Create listener BEFORE releasing lock to prevent race condition
     // where tracer might resume us before we start waiting
     let listener = st.event.listen();
 
+    // Set stop state, save context
     st.stopped = true;
     st.stop_reason = Some(reason);
     st.saved = Some(SavedCtx { tf: **uctx, sp: uctx.sp });
@@ -191,9 +207,16 @@ pub fn stop_current_and_wait(reason: StopReason, uctx: &axhal::uspace::UserConte
     });
 }
 
-/// Resume a stopped tracee and notify waiters.
+/// Resume a stopped tracee and notify waiters, clearing its stop state.
+/// 
+/// This function would:
+/// 1. Acquire the ptrace_state lock for the given pid.
+/// 2. Check if the process is in a stopped state.
+/// 3. If so, clear the stop state and notify any waiters.
+/// 
+/// # Arguments
+/// * `pid` - The process ID of the tracee to resume.
 pub fn resume_pid(pid: Pid) {
-    use axlog::debug;
     let pd = get_process_data(pid).ok();
     if let Some(pd) = pd {
         let mut guard = pd.ptrace_state.lock();
@@ -212,6 +235,13 @@ pub fn resume_pid(pid: Pid) {
 }
 
 /// Check if a pid is in a ptrace stop; return encoded wait status if so.
+///
+/// # Arguments
+/// * `pid` - The process ID to check.
+/// 
+/// # Returns
+/// * `Some(i32)` - Encoded wait status if the tracee is stopped.
+/// * `None` - If the tracee is not stopped.
 pub fn encode_ptrace_stop_status(pid: Pid) -> Option<i32> {
     let pd = get_process_data(pid).ok()?;
     let guard = pd.ptrace_state.lock();
@@ -228,6 +258,9 @@ pub fn encode_ptrace_stop_status(pid: Pid) -> Option<i32> {
             Some(StopReason::Signal(n)) => n,
             None => SIGTRAP,
         };
+
+        // If TRACESYSGOOD is set and this is a syscall stop, set the 0x80 bit
+        // By doing so, tracers can distinguish syscall stops from normal SIGTRAP
         if st.options.contains(PtraceOptions::TRACESYSGOOD)
             && matches!(st.stop_reason, Some(StopReason::SyscallEntry | StopReason::SyscallExit))
         {
@@ -243,6 +276,14 @@ pub fn encode_ptrace_stop_status(pid: Pid) -> Option<i32> {
 
 /// Encode a ptrace stop for a specific tracer, and mark it reported so it will
 /// not be returned again until the tracee is resumed.
+/// 
+/// # Arguments
+/// * `pid` - The process ID of the tracee.
+/// * `expected_tracer` - The tracer PID expected to receive the stop.
+/// 
+/// # Returns
+/// * `Some(i32)` - Encoded wait status if the tracee is stopped and matches the tracer.
+/// * `None` - If the tracee is not stopped, already reported, or tracer
 pub fn encode_ptrace_stop_status_for_tracer(pid: Pid, expected_tracer: Pid) -> Option<i32> {
     use axlog::debug;
     let pd = get_process_data(pid).ok()?;

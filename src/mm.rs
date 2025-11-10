@@ -4,6 +4,15 @@ use starry_core::task::get_process_data;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 use axhal::mem::phys_to_virt;
 
+/// Read memory from a tracee's address space into the provided buffer.
+/// 
+/// # Arguments
+/// * `tracee_pid` - The PID of the tracee process to read from.
+/// * `virt_addr` - The virtual address in the tracee's address space to read from.
+/// * `buffer` - The buffer to fill with the read data.
+/// 
+/// # Returns
+/// * `AxResult<()>` - Ok on success, Err on failure (e.g., bad address).
 pub fn read_from_tracee(tracee_pid: Pid, virt_addr: usize, buffer: &mut [u8]) -> AxResult<()> {
     let tracee_proc_data = get_process_data(tracee_pid)?;
     let tracee_aspace = tracee_proc_data.aspace.lock();
@@ -20,6 +29,25 @@ pub fn read_from_tracee(tracee_pid: Pid, virt_addr: usize, buffer: &mut [u8]) ->
     }
 }
 
+/// Internal helper to read memory from a tracee's address space using its page table.
+/// 
+/// This function would:
+/// 1. Iterate over the buffer in page-sized chunks.
+/// 2. For each chunk, query the tracee's page table to get the physical address.
+/// 3. Map the physical address to a kernel virtual address.
+/// 4. Copy the data from the kernel virtual address to the provided buffer.
+///
+/// # Safety
+/// This function performs raw pointer dereferencing and assumes the
+/// provided address space and virtual address are valid.
+/// 
+/// # Arguments
+/// * `aspace` - The address space of the tracee process.
+/// * `virt_addr` - The starting virtual address to read from.
+/// * `buffer` - The buffer to fill with the read data.
+/// 
+/// # Returns
+/// * `AxResult<()>` - Ok on success, Err on failure (e.g., bad address).
 unsafe fn read_via_tracee_pgtable(
     aspace: &axmm::AddrSpace,
     virt_addr: usize,
